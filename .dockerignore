@@ -1,0 +1,13 @@
+# Never bake local secrets or developer state into the image.
+.env
+data/
+uploads/
+
+.venv/
+venv/
+__pycache__/
+*.py[cod]
+.pytest_cache/
+*.db
+*.db-wal
+*.db-shm
