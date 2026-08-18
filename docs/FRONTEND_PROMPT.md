@@ -56,15 +56,45 @@ If the design MCP is not reachable in your environment (no interactive terminal 
 - `Stock Market Projector.dc.html` is the **public projector/large-screen dashboard**. Treat its layout, type scale, spacing, color tokens, trend colors, and motion as the specification for the public view.
 - Extract the design's **tokens** (colors, typography, spacing, radii, shadows, the up/down/flat trend colors) into the frontend's styling layer once, and build every component — public *and* admin — from those tokens. The admin screens must look like they belong to the same product even where the design does not cover them directly.
 - `support.js` carries the behavior the design file relies on. Read it to understand intended interactions and animations (e.g. how values transition when a price changes), then reimplement that behavior idiomatically in React — do not ship the design file's script as-is.
-- The design is authored as a static artboard with placeholder data. Replace the placeholders with live API data (§4) — **without** altering the layout or visual language.
+- The design is authored as a static artboard with placeholder data. Replace the placeholders with live API data (§5) — **without** altering the layout or visual language.
 - **Follow the design closely. Do not redesign it.** The only changes permitted are those genuinely required for responsive behavior (notably the mobile-first admin pages, which the projector design does not cover) — and those must extend the design's own language rather than introduce a new one.
-- Where the design shows something the API cannot supply (see §4.5), keep the visual treatment and fill it from what the API *does* return, or drop that element cleanly. Never invent a backend endpoint to satisfy a mockup.
+- Where the design shows something the API cannot supply (see §5.5), keep the visual treatment and fill it from what the API *does* return, or drop that element cleanly. Never invent a backend endpoint to satisfy a mockup.
 
 ---
 
-## 3. Workflow: use Spec Kit
+## 3. Execution model — orchestra mode with subagents
 
-Build this feature with **[Spec Kit](https://github.com/github/spec-kit)** (spec-driven development). Do not jump straight to writing components.
+Run this build in **orchestra mode**. The main session is the **conductor**, not the bricklayer: it owns the spec, the plan, the task graph, integration, and verification. Feature code is written by **subagents** it dispatches.
+
+### Model and effort per role
+
+| Work | Subagent model | Reasoning effort |
+|---|---|---|
+| **Implementation — writing code** (components, pages, API client, hooks, styles, tests, config) | **Sonnet** | **low** |
+| **Everything else** (repo/API inspection, design import and token extraction, spec and plan drafting, task decomposition, review, integration checks, debugging analysis) | **Opus** | **low** |
+
+Spawn with the agent tool, setting `model` explicitly on every dispatch — `model: "sonnet"` for implementation, `model: "opus"` for all other roles. Never let a subagent inherit the model by default; state it every time.
+
+### How the conductor works
+
+1. **Think first, at the top.** The conductor reads the backend contract (§5) and the design (§2) itself — or via an Opus research subagent — before any code task exists. No implementation subagent is dispatched against an unexplored area.
+2. **Decompose to bounded units.** Every implementation task handed to a Sonnet subagent must be small enough to finish in one pass and fully specified: exact files to create or modify, the relevant contract excerpt inlined (endpoint, payload shape, error codes), the design tokens or component it must match, and explicit acceptance criteria. **A Sonnet-at-low-effort subagent is an executor, not an explorer** — if a task needs discovery or judgment, do that discovery first (Opus) and pass the conclusions down.
+3. **Sequence the foundations, then fan out.** Build the shared layer serially — design tokens, API client, type definitions, auth handling, routing shell, shared UI primitives — because everything else depends on it. Only after it is stable, dispatch page-level work in **parallel**, and only where tasks touch **disjoint files**. Two subagents editing the same file is a merge conflict you created yourself.
+4. **Verify every hand-back.** Do not take a subagent's report at face value. After each returned task the conductor runs the real checks — typecheck, lint, build, and the relevant tests — and reads the diff. If it fails, re-dispatch with the failure output included rather than patching around it.
+5. **Review with Opus.** Before marking a slice done, dispatch an Opus review subagent over the diff for contract drift (a field renamed, a number parsed out of a money string, a hardcoded URL, a missing loading/error state). Fixes from the review go back to a Sonnet subagent.
+6. **The conductor keeps the state.** Spec, plan, task list, and progress live in the main session and in `specs/`. Subagents start cold every time and share no memory — restate the context each dispatch instead of assuming continuity.
+7. **Escalate rather than guess.** A subagent that hits a genuine ambiguity reports back to the conductor; the conductor decides. Subagents do not invent backend endpoints, redesign UI, or widen scope on their own.
+
+### Mapping to the Spec Kit phases (§4)
+
+- `/constitution`, `/specify`, `/clarify`, `/plan`, `/tasks`, `/analyze` → conductor, with **Opus** subagents for parallel research (backend contract sweep, design token extraction, dependency/tooling checks).
+- `/implement` → conductor drives the task list, dispatching **Sonnet** subagents per task and verifying each result before moving on.
+
+---
+
+## 4. Workflow: use Spec Kit
+
+Build this feature with **[Spec Kit](https://github.com/github/spec-kit)** (spec-driven development). Do not jump straight to writing components. The conductor (§3) owns these phases and runs the slash commands; subagents execute the work they generate.
 
 ### Setup
 
@@ -86,7 +116,7 @@ This creates `.specify/` (templates, scripts, memory) and registers the slash co
    - Reusable components over per-page duplication.
 2. **`/specify`** — write the feature spec: public dashboard, request submission, admin login, admin ETF management, admin request review. Describe **what** and **why**, not implementation.
 3. **`/clarify`** — resolve ambiguities against the codebase, not by asking the user. Inspect `app/api/routes/`, `app/schemas/`, and `app/models/` and record what you found. Only surface a question if a wrong guess would make the work useless.
-4. **`/plan`** — the technical plan. Pin the stack (see §5), the folder structure, the API client layer, state/data-fetching approach, routing, and the env-var contract.
+4. **`/plan`** — the technical plan. Pin the stack (see §6), the folder structure, the API client layer, state/data-fetching approach, routing, and the env-var contract.
 5. **`/tasks`** — generate the ordered, dependency-aware task list.
 6. **`/analyze`** — cross-check spec ↔ plan ↔ tasks for gaps and contradictions before writing code.
 7. **`/implement`** — execute the tasks.
@@ -95,9 +125,9 @@ Keep `specs/<feature>/spec.md`, `plan.md`, and `tasks.md` committed alongside th
 
 ---
 
-## 4. Backend instructions (the contract you are building against)
+## 5. Backend instructions (the contract you are building against)
 
-### 4.1 Running the backend locally
+### 5.1 Running the backend locally
 
 ```bash
 cp .env.example .env          # then edit ADMIN_PASSWORD and JWT_SECRET
@@ -119,7 +149,7 @@ Backend env vars that affect the frontend:
 | `CURRENCY` | Default `لحوح`; echoed in responses as `currency`. |
 | `JWT_EXPIRE_MINUTES` | Token lifetime, default `720` (12h). |
 
-### 4.2 Conventions that apply to every endpoint
+### 5.2 Conventions that apply to every endpoint
 
 - All app routes are under **`/api`**. The only exception is **`GET /health`** → `{"status":"ok","version":"0.1.0"}`.
 - **Auth**: JWT bearer. Send `Authorization: Bearer <access_token>` on every admin route. There are no cookies and no refresh token.
@@ -145,7 +175,7 @@ Backend env vars that affect the frontend:
 
 - **Uploads accept only** `image/jpeg`, `image/png`, `image/webp`. The backend sniffs magic bytes, so a renamed file is rejected — validate type and size client-side first for a fast, friendly error.
 
-### 4.3 Public endpoints (no auth)
+### 5.3 Public endpoints (no auth)
 
 **`GET /api/etfs`** → `ETF[]`, ordered by `id`.
 **`GET /api/etfs/{id}`** → `ETF`.
@@ -213,7 +243,7 @@ Do **not** send a timestamp or a price — the backend stamps `created_at` and s
 
 > There is **no public endpoint to list or look up submitted requests**. A participant sees their request exactly once, in the response to their own submission. Design the success state accordingly (show the full receipt then and there); do not build a "my requests" view or a lookup-by-name screen.
 
-### 4.4 Admin endpoints (Bearer token required)
+### 5.4 Admin endpoints (Bearer token required)
 
 **`POST /api/auth/login`** — JSON `{ "username", "password" }` → `{ "access_token", "token_type": "bearer", "expires_in": 43200 }`. Wrong credentials → `401 UNAUTHORIZED`.
 
@@ -233,22 +263,22 @@ Do **not** send a timestamp or a price — the backend stamps `created_at` and s
 
 **`PATCH /api/admin/requests/{id}/status`** — JSON `{ "status": "APPROVED" }` → updated `TradeRequest`. Accepts `PENDING`, `APPROVED`, `REJECTED`. Approving/rejecting sets `processed_at`; setting it back to `PENDING` clears it. **This is not idempotent-guarded** — the backend does not block re-deciding an already-decided request, so the UI should confirm before changing a decision that has already been made.
 
-### 4.5 What the backend does *not* do
+### 5.5 What the backend does *not* do
 
 Plan around these; do not add backend endpoints for them.
 
 - **No WebSockets, no SSE.** The public dashboard must **poll `GET /api/etfs`** (10–15s is a sane interval for a camp screen). Poll on an interval that survives tab-visibility changes, and never let a failed poll blank out the last-good data — keep showing the last values with a subtle "reconnecting" indicator.
 - **No portfolio/holdings model.** Approving a request does not move units or money anywhere. It is a review workflow only. Don't imply balances in the UI.
 - **No ETF create/delete.** Exactly 7, always.
-- **No public request listing** (see §4.3).
+- **No public request listing** (see §5.3).
 - **No refresh tokens.** When the JWT expires the next admin call returns `401`; handle it globally by clearing the token and redirecting to login.
 - **Seeded ETFs start at value `0` with no logo and generic names.** The public dashboard must look correct in that pre-camp state — that is a real empty state, not an edge case.
 
 ---
 
-## 5. Frontend requirements
+## 6. Frontend requirements
 
-- **React** (Vite). TypeScript preferred; generate types from `/openapi.json` or hand-write them to match §4 exactly.
+- **React** (Vite). TypeScript preferred; generate types from `/openapi.json` or hand-write them to match §5 exactly.
 - **Connect to the existing FastAPI API** — one thin API client module that owns the base URL, auth header injection, multipart handling, error-envelope parsing, and image-URL absolutization. Components never call `fetch` directly.
 - **Clean, reusable components.** ETF card, trend indicator, money display, image uploader, status badge, form field, empty/error/loading states — build them once.
 - **Handle loading, empty, success, and error states properly** in every view. No spinner-forever, no silent failure, no raw validator JSON shown to a participant.
@@ -256,7 +286,7 @@ Plan around these; do not add backend endpoints for them.
 - **Admin pages prioritize responsive mobile usability**: thumb-reachable controls, a decision flow that works one-handed, no horizontal scrolling, image previews that don't blow up the layout.
 - Arabic currency name and any Arabic copy must render correctly (font + direction) inside the existing design.
 
-## 6. Deployment
+## 7. Deployment
 
 - Frontend and backend are hosted on **App Platform** as separate components.
 - **Use environment variables for API URLs and deployment-specific configuration.** With Vite, that means `VITE_`-prefixed vars read via `import.meta.env`:
@@ -265,8 +295,8 @@ Plan around these; do not add backend endpoints for them.
 - Remember to add the deployed frontend origin to the backend's `CORS_ORIGINS` — a correct frontend still fails without it.
 - Uploaded images are served by the **backend** at `/uploads/...`; on App Platform the `data/` and `uploads/` directories must be persistent volumes or the images vanish on restart.
 
-## 7. Working style
+## 8. Working style
 
-Before coding, inspect the existing repository and the finished design (§2) carefully. Preserve the current architecture and styling conventions.
+Work in orchestra mode (§3): the conductor inspects, plans, and verifies; Sonnet subagents write the code. Before any of it, inspect the existing repository and the finished design (§2) carefully. Preserve the current architecture and styling conventions.
 
 **Do not ask unnecessary questions.** If something small is unspecified, inspect the codebase, make the most reasonable MVP decision, state the assumption in the spec, and continue.
