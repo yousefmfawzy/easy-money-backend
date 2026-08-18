@@ -114,12 +114,13 @@ This creates `.specify/` (templates, scripts, memory) and registers the slash co
    - Every data view handles **loading / empty / success / error** states.
    - No hardcoded URLs; all environment-specific values come from env vars.
    - Reusable components over per-page duplication.
+   - Orchestra mode is binding: implementation is written by **Sonnet** subagents at **low** effort, everything else runs on **Opus** at **low** effort (§3).
 2. **`/specify`** — write the feature spec: public dashboard, request submission, admin login, admin ETF management, admin request review. Describe **what** and **why**, not implementation.
 3. **`/clarify`** — resolve ambiguities against the codebase, not by asking the user. Inspect `app/api/routes/`, `app/schemas/`, and `app/models/` and record what you found. Only surface a question if a wrong guess would make the work useless.
 4. **`/plan`** — the technical plan. Pin the stack (see §6), the folder structure, the API client layer, state/data-fetching approach, routing, and the env-var contract.
-5. **`/tasks`** — generate the ordered, dependency-aware task list.
+5. **`/tasks`** — generate the ordered, dependency-aware task list. Size every task as **one bounded Sonnet dispatch**: a single file or component, with its contract excerpt and acceptance criteria attached, and mark which tasks are parallel-safe (disjoint files) versus foundational (must land first).
 6. **`/analyze`** — cross-check spec ↔ plan ↔ tasks for gaps and contradictions before writing code.
-7. **`/implement`** — execute the tasks.
+7. **`/implement`** — the conductor walks the task list, dispatching a **Sonnet** subagent per task and verifying each hand-back (typecheck, lint, build, diff read) before starting the next. Ambiguity or failure comes back to the conductor, never gets guessed at downstream.
 
 Keep `specs/<feature>/spec.md`, `plan.md`, and `tasks.md` committed alongside the code so the spec history is reviewable.
 
