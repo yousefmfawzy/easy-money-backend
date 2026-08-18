@@ -25,9 +25,7 @@ the service over to it.
 
    Then close and reopen PowerShell so the PATH change takes effect.
 
-2. **Install Docker Desktop** and start it.
-
-3. **Sign in.** The project's Region is `eu-north-1`:
+2. **Sign in.** The project's Region is `eu-north-1`:
 
    ```powershell
    aws configure set region eu-north-1 --profile default
@@ -37,13 +35,21 @@ the service over to it.
    Credentials last 12 hours and renew for 90 days without another browser
    sign-in. Re-run `aws login` when the deploy script reports "Not signed in".
 
+That is the whole list. **Docker is not required** — the container image is
+built in AWS CodeBuild, not on your machine.
+
 ## What gets created
 
 Everything lands in `eu-north-1` except CloudFront, which is global.
 
+Two stacks are deployed. `easy-money-build` holds the build pipeline, and
+`easy-money-backend` holds the application:
+
 | Resource | Purpose |
 |---|---|
-| ECR repository | Stores the container image |
+| S3 source bucket | Receives the zipped source each deploy uploads |
+| CodeBuild project | Builds the container image, so you need no local Docker |
+| ECR repository | Stores the built image, keeping the 10 most recent |
 | ECS Fargate service | Runs the app — one task, no servers to manage |
 | EFS filesystem | Holds `data/easymoney.db` and `uploads/` so they survive restarts |
 | Application Load Balancer | Health-checks the task and routes traffic to it |
@@ -126,7 +132,8 @@ Roughly, in `eu-north-1`, at idle:
 | Application Load Balancer | ~$18 |
 | Fargate task (0.25 vCPU, 0.5 GB, always on) | ~$9 |
 | EFS (a few GB, bursting) | ~$1 |
-| CloudFront, ECR, SSM, logs | Pennies at this traffic |
+| CloudFront, ECR, S3, SSM, logs | Pennies at this traffic |
+| CodeBuild | ~$0.01 per deploy, billed per build-minute |
 | **Total** | **~$28–30** |
 
 The ALB is the largest line item. If cost matters more than the managed-service
@@ -157,6 +164,10 @@ aws ecs update-service --cluster easy-money --service easy-money-backend `
 ```powershell
 aws cloudformation delete-stack --stack-name easy-money-backend `
   --profile default --region eu-north-1
+
+# The build pipeline is separate, and safe to remove too
+aws cloudformation delete-stack --stack-name easy-money-build `
+  --profile default --region eu-north-1
 ```
 
 The EFS filesystem is deliberately **retained** on delete so a teardown cannot
@@ -173,8 +184,12 @@ head` failing against the EFS-backed database.
 `/health` on port 8000. Confirm the container listens on `0.0.0.0:8000`, which
 the Dockerfile's `CMD` already does.
 
-**`exec format error` in the logs.** The image was built for the wrong
-architecture. Both deploy scripts pass `--platform linux/amd64` to avoid this.
+**The build fails.** The script prints the last 40 lines of the CodeBuild log
+on failure. For the full log:
+
+```powershell
+aws logs tail /aws/codebuild/easy-money-build --follow --profile default --region eu-north-1
+```
 
 **CloudFront returns 502.** Give the distribution a few minutes after the first
 deploy. If it persists, hit the `LoadBalancerDns` output directly over plain

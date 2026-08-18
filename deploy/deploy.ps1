@@ -1,16 +1,17 @@
 <#
 .SYNOPSIS
-    Builds the Easy Money backend image, pushes it to ECR, and deploys the
-    CloudFormation stack.
+    Builds the Easy Money backend image in AWS CodeBuild and deploys it to
+    ECS Fargate.
 
 .DESCRIPTION
-    Run this from the repository root on a machine that has the AWS CLI and
-    Docker Desktop installed, and that has already run `aws login`.
+    Run this from anywhere on a machine that has the AWS CLI installed and has
+    already run `aws login`. Docker is NOT required — the image is built in
+    AWS, not locally.
 
         .\deploy\deploy.ps1
 
     The script is idempotent: run it again after changing the code and it
-    builds a new image, pushes it, and rolls the service over to it.
+    builds a new image and rolls the service over to it.
 
 .PARAMETER Profile
     AWS CLI profile to use. Defaults to "default".
@@ -19,14 +20,15 @@
     AWS Region. Defaults to eu-north-1, the project's assigned Region.
 
 .PARAMETER CorsOrigins
-    Comma-separated frontend origins allowed to call the API.
+    Comma-separated frontend origins allowed to call the API. Defaults to the
+    value in .env.
 #>
 [CmdletBinding()]
 param(
     [string]$Profile = "default",
     [string]$Region = "eu-north-1",
     [string]$StackName = "easy-money-backend",
-    [string]$RepoName = "easy-money-backend",
+    [string]$BuildStackName = "easy-money-build",
     [string]$CorsOrigins = ""
 )
 
@@ -42,10 +44,8 @@ try {
     # -------------------------------------------------------------------------
     Step "Checking prerequisites"
 
-    foreach ($tool in @("aws", "docker")) {
-        if (-not (Get-Command $tool -ErrorAction SilentlyContinue)) {
-            throw "$tool is not on PATH. Install it and open a new PowerShell window."
-        }
+    if (-not (Get-Command aws -ErrorAction SilentlyContinue)) {
+        throw "The AWS CLI is not on PATH. Install it and open a new PowerShell window."
     }
 
     # Fails fast with a clear message if the login has expired, rather than
@@ -57,9 +57,6 @@ try {
     $AccountId = ($identity | ConvertFrom-Json).Account
     Write-Host "    Account: $AccountId"
     Write-Host "    Region:  $Region"
-
-    docker info *> $null
-    if ($LASTEXITCODE -ne 0) { throw "Docker is installed but not running. Start Docker Desktop." }
 
     # -------------------------------------------------------------------------
     Step "Reading configuration from .env"
@@ -100,41 +97,92 @@ try {
     Write-Host "    Stored /easy-money/JWT_SECRET and /easy-money/ADMIN_PASSWORD"
 
     # -------------------------------------------------------------------------
-    Step "Ensuring the ECR repository exists"
+    Step "Deploying the build pipeline"
 
-    aws ecr describe-repositories --repository-names $RepoName `
-        --profile $Profile --region $Region *> $null
-    if ($LASTEXITCODE -ne 0) {
-        aws ecr create-repository --repository-name $RepoName `
-            --image-scanning-configuration scanOnPush=true `
-            --profile $Profile --region $Region | Out-Null
-        Write-Host "    Created repository $RepoName"
-    } else {
-        Write-Host "    Repository $RepoName already exists"
-    }
+    aws cloudformation deploy `
+        --template-file "deploy/build-stack.yaml" `
+        --stack-name $BuildStackName `
+        --capabilities CAPABILITY_IAM `
+        --profile $Profile --region $Region
+    if ($LASTEXITCODE -ne 0) { throw "Build stack deploy failed." }
 
-    $Registry = "$AccountId.dkr.ecr.$Region.amazonaws.com"
-    # A unique tag per deploy, so ECS always sees a changed task definition and
-    # actually rolls the service. Reusing :latest would often be a no-op.
-    $Tag = Get-Date -Format "yyyyMMdd-HHmmss"
-    $ImageUri = "$Registry/${RepoName}:$Tag"
+    $buildOutputs = aws cloudformation describe-stacks --stack-name $BuildStackName `
+        --query "Stacks[0].Outputs" --output json --profile $Profile --region $Region | ConvertFrom-Json
+    $RepoUri      = ($buildOutputs | Where-Object { $_.OutputKey -eq "RepositoryUri" }).OutputValue
+    $SourceBucket = ($buildOutputs | Where-Object { $_.OutputKey -eq "SourceBucketName" }).OutputValue
+    $BuildProject = ($buildOutputs | Where-Object { $_.OutputKey -eq "BuildProjectName" }).OutputValue
+    Write-Host "    Repository: $RepoUri"
+    Write-Host "    Source:     s3://$SourceBucket"
 
     # -------------------------------------------------------------------------
-    Step "Building and pushing the image"
+    Step "Packaging source"
 
-    aws ecr get-login-password --profile $Profile --region $Region |
-        docker login --username AWS --password-stdin $Registry
-    if ($LASTEXITCODE -ne 0) { throw "docker login to ECR failed." }
+    # A unique tag per deploy, so ECS sees a changed task definition and
+    # actually rolls the service. Reusing :latest would often be a no-op.
+    $Tag = Get-Date -Format "yyyyMMdd-HHmmss"
+    $SourceKey = "source-$Tag.zip"
+    $Staging = Join-Path $env:TEMP "easy-money-src-$Tag"
+    $ZipPath = Join-Path $env:TEMP $SourceKey
 
-    # Fargate runs on x86_64; building on an ARM machine without this produces
-    # an image that fails to start with an exec format error.
-    docker build --platform linux/amd64 -t $ImageUri -t "$Registry/${RepoName}:latest" .
-    if ($LASTEXITCODE -ne 0) { throw "docker build failed." }
+    # Copy the working tree, minus directories that must never reach the build:
+    # .git is large, and data/ and uploads/ hold local state that the running
+    # app keeps on EFS instead.
+    $null = robocopy $RepoRoot $Staging /E `
+        /XD .git data uploads .venv venv __pycache__ .pytest_cache node_modules `
+        /XF "*.pyc" "*.db" "*.db-wal" "*.db-shm" `
+        /NFL /NDL /NJH /NJS /NP
+    # robocopy uses exit codes 0-7 for success; 8 and above are real failures.
+    if ($LASTEXITCODE -ge 8) { throw "Failed to stage source (robocopy exit $LASTEXITCODE)." }
+    $global:LASTEXITCODE = 0
 
-    docker push $ImageUri
-    if ($LASTEXITCODE -ne 0) { throw "docker push failed." }
-    docker push "$Registry/${RepoName}:latest" | Out-Null
-    Write-Host "    Pushed $ImageUri"
+    if (Test-Path $ZipPath) { Remove-Item $ZipPath -Force }
+    Compress-Archive -Path "$Staging\*" -DestinationPath $ZipPath -Force
+    Remove-Item $Staging -Recurse -Force
+    $sizeMb = [math]::Round((Get-Item $ZipPath).Length / 1MB, 1)
+    Write-Host "    Packaged $sizeMb MB"
+
+    aws s3 cp $ZipPath "s3://$SourceBucket/$SourceKey" --profile $Profile --region $Region | Out-Null
+    if ($LASTEXITCODE -ne 0) { throw "Failed to upload source to S3." }
+    Remove-Item $ZipPath -Force
+    Write-Host "    Uploaded s3://$SourceBucket/$SourceKey"
+
+    # -------------------------------------------------------------------------
+    Step "Building the image in CodeBuild (a few minutes)"
+
+    $BuildId = aws codebuild start-build `
+        --project-name $BuildProject `
+        --source-location-override "$SourceBucket/$SourceKey" `
+        --environment-variables-override "name=IMAGE_TAG,value=$Tag,type=PLAINTEXT" `
+        --query "build.id" --output text `
+        --profile $Profile --region $Region
+    if ($LASTEXITCODE -ne 0) { throw "Failed to start the build." }
+    Write-Host "    Build: $BuildId"
+
+    $status = "IN_PROGRESS"
+    while ($status -eq "IN_PROGRESS") {
+        Start-Sleep -Seconds 15
+        $status = aws codebuild batch-get-builds --ids $BuildId `
+            --query "builds[0].buildStatus" --output text `
+            --profile $Profile --region $Region
+        Write-Host "    $status"
+    }
+
+    if ($status -ne "SUCCEEDED") {
+        Warn "Build $status. Last 40 log lines:"
+        $logs = aws codebuild batch-get-builds --ids $BuildId `
+            --query "builds[0].logs.[groupName,streamName]" --output text `
+            --profile $Profile --region $Region
+        $group, $stream = $logs -split "\s+"
+        if ($group -and $group -ne "None") {
+            aws logs get-log-events --log-group-name $group --log-stream-name $stream `
+                --limit 40 --query "events[].message" --output text `
+                --profile $Profile --region $Region
+        }
+        throw "CodeBuild did not succeed."
+    }
+
+    $ImageUri = "${RepoUri}:$Tag"
+    Write-Host "    Built $ImageUri"
 
     # -------------------------------------------------------------------------
     Step "Discovering the default VPC and subnets"
@@ -159,7 +207,7 @@ try {
     Write-Host "    Subnets: $SubnetIds"
 
     # -------------------------------------------------------------------------
-    Step "Deploying the CloudFormation stack (this takes ~10 minutes the first time)"
+    Step "Deploying the application stack (~10 minutes the first time)"
 
     aws cloudformation deploy `
         --template-file "deploy/cloudformation.yaml" `
@@ -193,7 +241,7 @@ try {
     $healthUrl = ($outputs | Where-Object { $_.OutputKey -eq "HealthUrl" }).OutputValue
     Write-Host "`nCloudFront takes a few minutes to finish propagating." -ForegroundColor Yellow
     Write-Host "Once it has, check the API with:" -ForegroundColor Yellow
-    Write-Host "    curl $healthUrl"
+    Write-Host "    curl.exe $healthUrl"
 }
 finally {
     Pop-Location

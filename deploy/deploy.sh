@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 #
-# Builds the Easy Money backend image, pushes it to ECR, and deploys the
-# CloudFormation stack. macOS/Linux equivalent of deploy.ps1.
+# Builds the Easy Money backend image in AWS CodeBuild and deploys it to ECS
+# Fargate. macOS/Linux equivalent of deploy.ps1. Docker is NOT required.
 #
 # Usage, from anywhere:
 #   ./deploy/deploy.sh
@@ -16,20 +16,20 @@ set -euo pipefail
 PROFILE="${AWS_PROFILE_NAME:-default}"
 REGION="${AWS_REGION:-eu-north-1}"
 STACK_NAME="${STACK_NAME:-easy-money-backend}"
-REPO_NAME="${REPO_NAME:-easy-money-backend}"
+BUILD_STACK_NAME="${BUILD_STACK_NAME:-easy-money-build}"
 
 step() { printf '\n==> %s\n' "$1"; }
 warn() { printf '!!  %s\n' "$1" >&2; }
 
 # Always operate from the repository root.
 cd "$(dirname "${BASH_SOURCE[0]}")/.."
+REPO_ROOT=$(pwd)
 
 # -----------------------------------------------------------------------------
 step "Checking prerequisites"
 
-for tool in aws docker; do
-  command -v "$tool" >/dev/null || { warn "$tool is not on PATH."; exit 1; }
-done
+command -v aws >/dev/null || { warn "The AWS CLI is not on PATH."; exit 1; }
+command -v zip >/dev/null || { warn "zip is not on PATH."; exit 1; }
 
 if ! identity=$(aws sts get-caller-identity --profile "$PROFILE" --region "$REGION" --output json 2>&1); then
   warn "Not signed in. Run: aws login --region $REGION --profile $PROFILE"
@@ -40,14 +40,12 @@ ACCOUNT_ID=$(printf '%s' "$identity" | python3 -c 'import json,sys; print(json.l
 echo "    Account: $ACCOUNT_ID"
 echo "    Region:  $REGION"
 
-docker info >/dev/null 2>&1 || { warn "Docker is not running."; exit 1; }
-
 # -----------------------------------------------------------------------------
 step "Reading configuration from .env"
 
 # The image deliberately does not contain .env (see .dockerignore), so secrets
 # are read here and stored in SSM rather than baked into the image.
-[ -f .env ] || { warn "No .env file found in $(pwd)."; exit 1; }
+[ -f .env ] || { warn "No .env file found in $REPO_ROOT."; exit 1; }
 
 get_env() { grep -E "^\s*$1=" .env | head -1 | cut -d= -f2- | xargs || true; }
 
@@ -76,36 +74,83 @@ aws ssm put-parameter --name /easy-money/ADMIN_PASSWORD --value "$ADMIN_PASSWORD
 echo "    Stored /easy-money/JWT_SECRET and /easy-money/ADMIN_PASSWORD"
 
 # -----------------------------------------------------------------------------
-step "Ensuring the ECR repository exists"
+step "Deploying the build pipeline"
 
-if aws ecr describe-repositories --repository-names "$REPO_NAME" \
-     --profile "$PROFILE" --region "$REGION" >/dev/null 2>&1; then
-  echo "    Repository $REPO_NAME already exists"
-else
-  aws ecr create-repository --repository-name "$REPO_NAME" \
-    --image-scanning-configuration scanOnPush=true \
-    --profile "$PROFILE" --region "$REGION" >/dev/null
-  echo "    Created repository $REPO_NAME"
-fi
+aws cloudformation deploy \
+  --template-file deploy/build-stack.yaml \
+  --stack-name "$BUILD_STACK_NAME" \
+  --capabilities CAPABILITY_IAM \
+  --profile "$PROFILE" --region "$REGION"
 
-REGISTRY="$ACCOUNT_ID.dkr.ecr.$REGION.amazonaws.com"
+stack_output() {
+  aws cloudformation describe-stacks --stack-name "$BUILD_STACK_NAME" \
+    --query "Stacks[0].Outputs[?OutputKey=='$1'].OutputValue" --output text \
+    --profile "$PROFILE" --region "$REGION"
+}
+REPO_URI=$(stack_output RepositoryUri)
+SOURCE_BUCKET=$(stack_output SourceBucketName)
+BUILD_PROJECT=$(stack_output BuildProjectName)
+echo "    Repository: $REPO_URI"
+echo "    Source:     s3://$SOURCE_BUCKET"
+
+# -----------------------------------------------------------------------------
+step "Packaging source"
+
 # A unique tag per deploy, so ECS sees a changed task definition and actually
 # rolls the service. Reusing :latest would often be a no-op.
 TAG=$(date +%Y%m%d-%H%M%S)
-IMAGE_URI="$REGISTRY/$REPO_NAME:$TAG"
+SOURCE_KEY="source-$TAG.zip"
+ZIP_PATH="${TMPDIR:-/tmp}/$SOURCE_KEY"
+rm -f "$ZIP_PATH"
+
+# Exclude directories that must never reach the build: .git is large, and
+# data/ and uploads/ hold local state the running app keeps on EFS instead.
+zip -qr "$ZIP_PATH" . \
+  -x '.git/*' 'data/*' 'uploads/*' '.venv/*' 'venv/*' \
+     '*__pycache__/*' '*.pyc' '.pytest_cache/*' 'node_modules/*' \
+     '*.db' '*.db-wal' '*.db-shm'
+echo "    Packaged $(du -h "$ZIP_PATH" | cut -f1)"
+
+aws s3 cp "$ZIP_PATH" "s3://$SOURCE_BUCKET/$SOURCE_KEY" \
+  --profile "$PROFILE" --region "$REGION" >/dev/null
+rm -f "$ZIP_PATH"
+echo "    Uploaded s3://$SOURCE_BUCKET/$SOURCE_KEY"
 
 # -----------------------------------------------------------------------------
-step "Building and pushing the image"
+step "Building the image in CodeBuild (a few minutes)"
 
-aws ecr get-login-password --profile "$PROFILE" --region "$REGION" \
-  | docker login --username AWS --password-stdin "$REGISTRY"
+BUILD_ID=$(aws codebuild start-build \
+  --project-name "$BUILD_PROJECT" \
+  --source-location-override "$SOURCE_BUCKET/$SOURCE_KEY" \
+  --environment-variables-override "name=IMAGE_TAG,value=$TAG,type=PLAINTEXT" \
+  --query "build.id" --output text \
+  --profile "$PROFILE" --region "$REGION")
+echo "    Build: $BUILD_ID"
 
-# Fargate runs x86_64; building on an Apple Silicon Mac without this produces
-# an image that fails to start with an exec format error.
-docker build --platform linux/amd64 -t "$IMAGE_URI" -t "$REGISTRY/$REPO_NAME:latest" .
-docker push "$IMAGE_URI"
-docker push "$REGISTRY/$REPO_NAME:latest" >/dev/null
-echo "    Pushed $IMAGE_URI"
+STATUS=IN_PROGRESS
+while [ "$STATUS" = "IN_PROGRESS" ]; do
+  sleep 15
+  STATUS=$(aws codebuild batch-get-builds --ids "$BUILD_ID" \
+    --query "builds[0].buildStatus" --output text \
+    --profile "$PROFILE" --region "$REGION")
+  echo "    $STATUS"
+done
+
+if [ "$STATUS" != "SUCCEEDED" ]; then
+  warn "Build $STATUS. Last 40 log lines:"
+  read -r LOG_GROUP LOG_STREAM <<<"$(aws codebuild batch-get-builds --ids "$BUILD_ID" \
+    --query "builds[0].logs.[groupName,streamName]" --output text \
+    --profile "$PROFILE" --region "$REGION")"
+  if [ -n "$LOG_GROUP" ] && [ "$LOG_GROUP" != "None" ]; then
+    aws logs get-log-events --log-group-name "$LOG_GROUP" --log-stream-name "$LOG_STREAM" \
+      --limit 40 --query "events[].message" --output text \
+      --profile "$PROFILE" --region "$REGION"
+  fi
+  exit 1
+fi
+
+IMAGE_URI="$REPO_URI:$TAG"
+echo "    Built $IMAGE_URI"
 
 # -----------------------------------------------------------------------------
 step "Discovering the default VPC and subnets"
@@ -127,7 +172,7 @@ echo "    VPC:     $VPC_ID"
 echo "    Subnets: $SUBNET_IDS"
 
 # -----------------------------------------------------------------------------
-step "Deploying the CloudFormation stack (~10 minutes the first time)"
+step "Deploying the application stack (~10 minutes the first time)"
 
 if ! aws cloudformation deploy \
   --template-file deploy/cloudformation.yaml \

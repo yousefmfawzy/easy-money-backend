@@ -1,0 +1,160 @@
+AWSTemplateFormatVersion: "2010-09-09"
+Description: >-
+  Build pipeline for the Easy Money backend. Holds the ECR repository, an S3
+  bucket for uploaded source archives, and a CodeBuild project that turns the
+  source into a container image. This exists so the image can be built without
+  Docker installed locally.
+
+  Deployed before the application stack, which consumes the image it produces.
+
+Resources:
+  Repository:
+    Type: AWS::ECR::Repository
+    # Retained on stack delete so images outlive a teardown of the build
+    # pipeline, and the app stack does not lose the image it is running.
+    DeletionPolicy: Retain
+    UpdateReplacePolicy: Retain
+    Properties:
+      RepositoryName: easy-money-backend
+      ImageScanningConfiguration:
+        ScanOnPush: true
+      LifecyclePolicy:
+        # Each deploy pushes a uniquely tagged image. Without this the
+        # repository grows without bound.
+        LifecyclePolicyText: |
+          {
+            "rules": [
+              {
+                "rulePriority": 1,
+                "description": "Keep the 10 most recent images",
+                "selection": {
+                  "tagStatus": "any",
+                  "countType": "imageCountMoreThan",
+                  "countNumber": 10
+                },
+                "action": { "type": "expire" }
+              }
+            ]
+          }
+
+  SourceBucket:
+    Type: AWS::S3::Bucket
+    Properties:
+      BucketName: !Sub easy-money-source-${AWS::AccountId}-${AWS::Region}
+      PublicAccessBlockConfiguration:
+        BlockPublicAcls: true
+        BlockPublicPolicy: true
+        IgnorePublicAcls: true
+        RestrictPublicBuckets: true
+      BucketEncryption:
+        ServerSideEncryptionConfiguration:
+          - ServerSideEncryptionByDefault:
+              SSEAlgorithm: AES256
+      LifecycleConfiguration:
+        Rules:
+          # Source archives are only needed for the duration of a build.
+          - Id: expire-old-source
+            Status: Enabled
+            ExpirationInDays: 7
+
+  BuildRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: codebuild.amazonaws.com
+            Action: sts:AssumeRole
+      Policies:
+        - PolicyName: build-and-push
+          PolicyDocument:
+            Version: "2012-10-17"
+            Statement:
+              - Effect: Allow
+                Action:
+                  - logs:CreateLogGroup
+                  - logs:CreateLogStream
+                  - logs:PutLogEvents
+                Resource: !Sub arn:aws:logs:${AWS::Region}:${AWS::AccountId}:log-group:/aws/codebuild/easy-money-build*
+              - Effect: Allow
+                # This one cannot be scoped to a repository: the token is
+                # account-wide by design.
+                Action: ecr:GetAuthorizationToken
+                Resource: "*"
+              - Effect: Allow
+                Action:
+                  - ecr:BatchCheckLayerAvailability
+                  - ecr:CompleteLayerUpload
+                  - ecr:InitiateLayerUpload
+                  - ecr:PutImage
+                  - ecr:UploadLayerPart
+                Resource: !GetAtt Repository.Arn
+              - Effect: Allow
+                Action:
+                  - s3:GetObject
+                  - s3:GetObjectVersion
+                Resource: !Sub ${SourceBucket.Arn}/*
+
+  BuildProject:
+    Type: AWS::CodeBuild::Project
+    Properties:
+      Name: easy-money-build
+      ServiceRole: !GetAtt BuildRole.Arn
+      Artifacts:
+        Type: NO_ARTIFACTS
+      Source:
+        Type: S3
+        # The deploy script overrides this per build with the archive it just
+        # uploaded; this is only the default.
+        Location: !Sub ${SourceBucket}/source.zip
+        BuildSpec: |
+          version: 0.2
+          phases:
+            pre_build:
+              commands:
+                - echo "Logging in to ECR"
+                - aws ecr get-login-password --region $AWS_DEFAULT_REGION | docker login --username AWS --password-stdin $REGISTRY
+            build:
+              commands:
+                - echo "Building $REPO_URI:$IMAGE_TAG"
+                - docker build -t $REPO_URI:$IMAGE_TAG -t $REPO_URI:latest .
+            post_build:
+              commands:
+                - docker push $REPO_URI:$IMAGE_TAG
+                - docker push $REPO_URI:latest
+                - echo "Pushed $REPO_URI:$IMAGE_TAG"
+      Environment:
+        Type: LINUX_CONTAINER
+        # x86_64, which matches the Fargate platform the image runs on.
+        Image: aws/codebuild/standard:7.0
+        ComputeType: BUILD_GENERAL1_SMALL
+        # Required to run the Docker daemon inside the build container.
+        PrivilegedMode: true
+        EnvironmentVariables:
+          - Name: REGISTRY
+            Value: !Sub ${AWS::AccountId}.dkr.ecr.${AWS::Region}.amazonaws.com
+          - Name: REPO_URI
+            Value: !Sub ${AWS::AccountId}.dkr.ecr.${AWS::Region}.amazonaws.com/${Repository}
+          - Name: IMAGE_TAG
+            # Overridden per build by the deploy script.
+            Value: latest
+      TimeoutInMinutes: 20
+      LogsConfig:
+        CloudWatchLogs:
+          Status: ENABLED
+          GroupName: /aws/codebuild/easy-money-build
+
+Outputs:
+  RepositoryUri:
+    Description: ECR repository URI that built images are pushed to
+    Value: !Sub ${AWS::AccountId}.dkr.ecr.${AWS::Region}.amazonaws.com/${Repository}
+
+  SourceBucketName:
+    Description: S3 bucket the deploy script uploads source archives to
+    Value: !Ref SourceBucket
+
+  BuildProjectName:
+    Description: CodeBuild project that builds the image
+    Value: !Ref BuildProject
