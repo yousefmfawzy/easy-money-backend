@@ -1,0 +1,438 @@
+AWSTemplateFormatVersion: "2010-09-09"
+Description: >-
+  Easy Money backend on ECS Fargate, behind an internal ALB and a CloudFront
+  distribution. Persistent state (the SQLite database and uploaded images)
+  lives on EFS so it survives task restarts and redeployments.
+
+Parameters:
+  VpcId:
+    Type: AWS::EC2::VPC::Id
+    Description: VPC to deploy into. The deploy script passes the default VPC.
+
+  SubnetIds:
+    Type: List<AWS::EC2::Subnet::Id>
+    Description: >-
+      Two or more subnets in different Availability Zones. These must have a
+      route to the internet (the default VPC's public subnets do) so Fargate
+      can pull the image from ECR.
+
+  ImageUri:
+    Type: String
+    Description: Full ECR image URI including tag, e.g. <acct>.dkr.ecr.eu-north-1.amazonaws.com/easy-money-backend:latest
+
+  CorsOrigins:
+    Type: String
+    Default: http://localhost:5173
+    Description: Comma-separated list of allowed CORS origins. Add your frontend URL here.
+
+  JwtSecretParameter:
+    Type: String
+    Default: /easy-money/JWT_SECRET
+    Description: Name of the SSM SecureString parameter holding JWT_SECRET.
+
+  AdminPasswordParameter:
+    Type: String
+    Default: /easy-money/ADMIN_PASSWORD
+    Description: Name of the SSM SecureString parameter holding ADMIN_PASSWORD.
+
+  AdminUsername:
+    Type: String
+    Default: admin
+    Description: Admin username. Not a secret, so it is passed as a plain env var.
+
+  ContainerCpu:
+    Type: String
+    Default: "256"
+    AllowedValues: ["256", "512", "1024"]
+
+  ContainerMemory:
+    Type: String
+    Default: "512"
+    AllowedValues: ["512", "1024", "2048"]
+
+Resources:
+  # ---------------------------------------------------------------------------
+  # Networking
+  #
+  # Three security groups chained together so nothing is reachable directly
+  # from the internet except the load balancer: internet -> ALB -> task -> EFS.
+  # ---------------------------------------------------------------------------
+  AlbSecurityGroup:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      GroupDescription: Allows inbound HTTP to the Easy Money load balancer
+      VpcId: !Ref VpcId
+      SecurityGroupIngress:
+        # Open to the world because CloudFront does not publish a fixed IP
+        # range we can scope this to without the managed prefix list. The ALB
+        # only ever serves the app, and CloudFront is the intended front door.
+        - IpProtocol: tcp
+          FromPort: 80
+          ToPort: 80
+          CidrIp: 0.0.0.0/0
+          Description: HTTP from CloudFront
+      Tags:
+        - Key: Name
+          Value: easy-money-alb
+
+  ServiceSecurityGroup:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      GroupDescription: Easy Money Fargate tasks. Only the ALB may reach the app port.
+      VpcId: !Ref VpcId
+      SecurityGroupIngress:
+        - IpProtocol: tcp
+          FromPort: 8000
+          ToPort: 8000
+          SourceSecurityGroupId: !Ref AlbSecurityGroup
+          Description: uvicorn, from the load balancer only
+      Tags:
+        - Key: Name
+          Value: easy-money-service
+
+  EfsSecurityGroup:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      GroupDescription: Easy Money EFS mount targets. Only the tasks may mount them.
+      VpcId: !Ref VpcId
+      SecurityGroupIngress:
+        - IpProtocol: tcp
+          FromPort: 2049
+          ToPort: 2049
+          SourceSecurityGroupId: !Ref ServiceSecurityGroup
+          Description: NFS from the Fargate tasks
+      Tags:
+        - Key: Name
+          Value: easy-money-efs
+
+  # ---------------------------------------------------------------------------
+  # Persistent storage
+  #
+  # The app keeps its SQLite database in /app/data and uploaded images in
+  # /app/uploads. Both are mounted from EFS, each through its own access point
+  # so the two directories stay isolated and are created with the right
+  # ownership on first mount.
+  # ---------------------------------------------------------------------------
+  FileSystem:
+    Type: AWS::EFS::FileSystem
+    # Retained on stack delete so a teardown cannot silently destroy the
+    # database and every uploaded image.
+    DeletionPolicy: Retain
+    UpdateReplacePolicy: Retain
+    Properties:
+      Encrypted: true
+      PerformanceMode: generalPurpose
+      ThroughputMode: bursting
+      FileSystemTags:
+        - Key: Name
+          Value: easy-money-data
+
+  MountTargetA:
+    Type: AWS::EFS::MountTarget
+    Properties:
+      FileSystemId: !Ref FileSystem
+      SubnetId: !Select [0, !Ref SubnetIds]
+      SecurityGroups:
+        - !Ref EfsSecurityGroup
+
+  MountTargetB:
+    Type: AWS::EFS::MountTarget
+    Properties:
+      FileSystemId: !Ref FileSystem
+      SubnetId: !Select [1, !Ref SubnetIds]
+      SecurityGroups:
+        - !Ref EfsSecurityGroup
+
+  DataAccessPoint:
+    Type: AWS::EFS::AccessPoint
+    Properties:
+      FileSystemId: !Ref FileSystem
+      PosixUser:
+        Uid: "0"
+        Gid: "0"
+      RootDirectory:
+        Path: /data
+        CreationInfo:
+          OwnerUid: "0"
+          OwnerGid: "0"
+          Permissions: "0755"
+
+  UploadsAccessPoint:
+    Type: AWS::EFS::AccessPoint
+    Properties:
+      FileSystemId: !Ref FileSystem
+      PosixUser:
+        Uid: "0"
+        Gid: "0"
+      RootDirectory:
+        Path: /uploads
+        CreationInfo:
+          OwnerUid: "0"
+          OwnerGid: "0"
+          Permissions: "0755"
+
+  # ---------------------------------------------------------------------------
+  # IAM
+  # ---------------------------------------------------------------------------
+  TaskExecutionRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: ecs-tasks.amazonaws.com
+            Action: sts:AssumeRole
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/service-role/AmazonECSTaskExecutionRolePolicy
+      Policies:
+        # The execution role resolves the SSM secrets before the container
+        # starts, so it needs read access to just those two parameters.
+        - PolicyName: read-app-secrets
+          PolicyDocument:
+            Version: "2012-10-17"
+            Statement:
+              - Effect: Allow
+                Action:
+                  - ssm:GetParameters
+                Resource:
+                  - !Sub arn:aws:ssm:${AWS::Region}:${AWS::AccountId}:parameter${JwtSecretParameter}
+                  - !Sub arn:aws:ssm:${AWS::Region}:${AWS::AccountId}:parameter${AdminPasswordParameter}
+
+  TaskRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: ecs-tasks.amazonaws.com
+            Action: sts:AssumeRole
+      Policies:
+        - PolicyName: efs-access
+          PolicyDocument:
+            Version: "2012-10-17"
+            Statement:
+              - Effect: Allow
+                Action:
+                  - elasticfilesystem:ClientMount
+                  - elasticfilesystem:ClientWrite
+                Resource: !GetAtt FileSystem.Arn
+
+  # ---------------------------------------------------------------------------
+  # Compute
+  # ---------------------------------------------------------------------------
+  LogGroup:
+    Type: AWS::Logs::LogGroup
+    Properties:
+      LogGroupName: /ecs/easy-money-backend
+      RetentionInDays: 14
+
+  Cluster:
+    Type: AWS::ECS::Cluster
+    Properties:
+      ClusterName: easy-money
+
+  TaskDefinition:
+    Type: AWS::ECS::TaskDefinition
+    Properties:
+      Family: easy-money-backend
+      RequiresCompatibilities:
+        - FARGATE
+      NetworkMode: awsvpc
+      Cpu: !Ref ContainerCpu
+      Memory: !Ref ContainerMemory
+      ExecutionRoleArn: !GetAtt TaskExecutionRole.Arn
+      TaskRoleArn: !GetAtt TaskRole.Arn
+      Volumes:
+        - Name: data
+          EFSVolumeConfiguration:
+            FilesystemId: !Ref FileSystem
+            TransitEncryption: ENABLED
+            AuthorizationConfig:
+              AccessPointId: !Ref DataAccessPoint
+              IAM: ENABLED
+        - Name: uploads
+          EFSVolumeConfiguration:
+            FilesystemId: !Ref FileSystem
+            TransitEncryption: ENABLED
+            AuthorizationConfig:
+              AccessPointId: !Ref UploadsAccessPoint
+              IAM: ENABLED
+      ContainerDefinitions:
+        - Name: api
+          Image: !Ref ImageUri
+          Essential: true
+          PortMappings:
+            - ContainerPort: 8000
+              Protocol: tcp
+          MountPoints:
+            - SourceVolume: data
+              ContainerPath: /app/data
+            - SourceVolume: uploads
+              ContainerPath: /app/uploads
+          Environment:
+            - Name: DATABASE_URL
+              Value: sqlite:////app/data/easymoney.db
+            - Name: UPLOAD_DIR
+              Value: /app/uploads
+            - Name: CORS_ORIGINS
+              Value: !Ref CorsOrigins
+            - Name: ADMIN_USERNAME
+              Value: !Ref AdminUsername
+          Secrets:
+            - Name: JWT_SECRET
+              ValueFrom: !Sub arn:aws:ssm:${AWS::Region}:${AWS::AccountId}:parameter${JwtSecretParameter}
+            - Name: ADMIN_PASSWORD
+              ValueFrom: !Sub arn:aws:ssm:${AWS::Region}:${AWS::AccountId}:parameter${AdminPasswordParameter}
+          LogConfiguration:
+            LogDriver: awslogs
+            Options:
+              awslogs-group: !Ref LogGroup
+              awslogs-region: !Ref AWS::Region
+              awslogs-stream-prefix: api
+
+  Service:
+    Type: AWS::ECS::Service
+    DependsOn:
+      - Listener
+      - MountTargetA
+      - MountTargetB
+    Properties:
+      ServiceName: easy-money-backend
+      Cluster: !Ref Cluster
+      TaskDefinition: !Ref TaskDefinition
+      LaunchType: FARGATE
+      # Exactly one task, always. SQLite cannot take concurrent writers from
+      # two tasks sharing one EFS file, so the app must never run two copies.
+      DesiredCount: 1
+      DeploymentConfiguration:
+        # Stop the old task before starting the new one, for the same reason:
+        # a rolling deploy would briefly overlap two writers. This trades a
+        # few seconds of downtime per deploy for database safety.
+        MinimumHealthyPercent: 0
+        MaximumPercent: 100
+      HealthCheckGracePeriodSeconds: 60
+      NetworkConfiguration:
+        AwsvpcConfiguration:
+          # Needed to reach ECR and CloudWatch Logs from a public subnet
+          # without paying for a NAT gateway.
+          AssignPublicIp: ENABLED
+          Subnets: !Ref SubnetIds
+          SecurityGroups:
+            - !Ref ServiceSecurityGroup
+      LoadBalancers:
+        - ContainerName: api
+          ContainerPort: 8000
+          TargetGroupArn: !Ref TargetGroup
+
+  # ---------------------------------------------------------------------------
+  # Load balancer
+  # ---------------------------------------------------------------------------
+  LoadBalancer:
+    Type: AWS::ElasticLoadBalancingV2::LoadBalancer
+    Properties:
+      Name: easy-money-alb
+      Type: application
+      Scheme: internet-facing
+      Subnets: !Ref SubnetIds
+      SecurityGroups:
+        - !Ref AlbSecurityGroup
+
+  TargetGroup:
+    Type: AWS::ElasticLoadBalancingV2::TargetGroup
+    Properties:
+      Name: easy-money-tg
+      VpcId: !Ref VpcId
+      Port: 8000
+      Protocol: HTTP
+      TargetType: ip
+      HealthCheckPath: /health
+      HealthCheckIntervalSeconds: 30
+      HealthyThresholdCount: 2
+      UnhealthyThresholdCount: 3
+      Matcher:
+        HttpCode: "200"
+      TargetGroupAttributes:
+        # The app starts fast and holds no long-lived connections.
+        - Key: deregistration_delay.timeout_seconds
+          Value: "10"
+
+  Listener:
+    Type: AWS::ElasticLoadBalancingV2::Listener
+    Properties:
+      LoadBalancerArn: !Ref LoadBalancer
+      Port: 80
+      Protocol: HTTP
+      DefaultActions:
+        - Type: forward
+          TargetGroupArn: !Ref TargetGroup
+
+  # ---------------------------------------------------------------------------
+  # CloudFront
+  #
+  # Gives the API an HTTPS endpoint on a *.cloudfront.net domain without
+  # owning a domain name. CloudFront is a global service, so this resource is
+  # not bound to the project Region.
+  # ---------------------------------------------------------------------------
+  Distribution:
+    Type: AWS::CloudFront::Distribution
+    Properties:
+      DistributionConfig:
+        Enabled: true
+        Comment: Easy Money backend API
+        HttpVersion: http2
+        PriceClass: PriceClass_100
+        Origins:
+          - Id: alb
+            DomainName: !GetAtt LoadBalancer.DNSName
+            CustomOriginConfig:
+              # The ALB listener is plain HTTP. The viewer-to-CloudFront hop
+              # is HTTPS; the CloudFront-to-ALB hop stays inside AWS.
+              OriginProtocolPolicy: http-only
+              HTTPPort: 80
+        DefaultCacheBehavior:
+          TargetOriginId: alb
+          ViewerProtocolPolicy: redirect-to-https
+          AllowedMethods: [GET, HEAD, OPTIONS, PUT, POST, PATCH, DELETE]
+          CachedMethods: [GET, HEAD]
+          # Managed-CachingDisabled: this is an API, so nothing is cached.
+          CachePolicyId: 4135ea2d-6df8-44a3-9df3-4b5a84be39ad
+          # Managed-AllViewerExceptHostHeader: forwards the Authorization
+          # header and query strings through to the app.
+          OriginRequestPolicyId: b689b0a8-53d0-40ab-baf2-68738e2966ac
+
+Outputs:
+  ApiUrl:
+    Description: Public HTTPS endpoint for the API
+    Value: !Sub https://${Distribution.DomainName}
+
+  HealthUrl:
+    Description: Health check endpoint, for confirming the deployment is live
+    Value: !Sub https://${Distribution.DomainName}/health
+
+  DocsUrl:
+    Description: FastAPI interactive docs
+    Value: !Sub https://${Distribution.DomainName}/docs
+
+  LoadBalancerDns:
+    Description: ALB hostname, useful for debugging the origin directly
+    Value: !GetAtt LoadBalancer.DNSName
+
+  FileSystemId:
+    Description: EFS filesystem holding the database and uploads. Retained on stack delete.
+    Value: !Ref FileSystem
+
+  LogGroupName:
+    Description: CloudWatch log group for application logs
+    Value: !Ref LogGroup
+
+  ClusterName:
+    Description: ECS cluster name, for the aws ecs commands in deploy/README.md
+    Value: !Ref Cluster
+
+  ServiceName:
+    Description: ECS service name, for the aws ecs commands in deploy/README.md
+    Value: !GetAtt Service.Name
